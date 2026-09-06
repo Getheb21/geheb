@@ -10,7 +10,7 @@ import logging
 from datetime import datetime
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -153,7 +153,6 @@ class GoHub:
                 async with aiohttp.ClientSession() as s:
                     async with s.get(url, headers=h, timeout=aiohttp.ClientTimeout(total=30)) as r:
                         response_text = await r.text()
-                        logger.info(f"Detail attempt {attempt+1}: HTTP {r.status}")
                         
                         data = json.loads(response_text)
                         if data.get('success') and data.get('data'):
@@ -288,25 +287,6 @@ class GoHub:
             
             await asyncio.sleep(5)
 
-async def button_callback(update, context):
-    """Handle inline button callback"""
-    query = update.callback_query
-    
-    if query.data.startswith("copy|"):
-        qr_content = query.data.split("|", 1)[1]
-        
-        await query.answer("QR Content berhasil disalin!")
-        
-        try:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"📋 QR Content:\n\n{qr_content}"
-            )
-        except:
-            pass
-    
-    await query.answer()
-
 async def start_command(update, context):
     if not update.message or not update.message.text:
         return
@@ -336,7 +316,7 @@ async def start_command(update, context):
         qr_content = result['qr_content']
         qr_image_url = result.get('qr_image_url', '')
         
-        # Text TANPA backtick untuk QR content
+        # QR Content tampil sebagai teks biasa (bisa langsung di-copy)
         final_text = (
             f"✅ **eSIM BERHASIL!**\n\n"
             f"📧 {result['email']}\n"
@@ -350,13 +330,8 @@ async def start_command(update, context):
             f"BY: {username}"
         )
         
-        # Keyboard
+        # Keyboard TANPA tombol salin
         keyboard_buttons = []
-        
-        # Tombol salin QR content
-        keyboard_buttons.append([
-            InlineKeyboardButton("📋 Salin QR Content", callback_data=f"copy|{qr_content}")
-        ])
         
         # Tombol QR Image (kalau ada)
         if qr_image_url:
@@ -385,6 +360,17 @@ async def start_command(update, context):
                 text=final_text,
                 reply_markup=keyboard
             )
+        
+        # Kirim QR image sebagai foto terpisah
+        if qr_image_url:
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=qr_image_url,
+                    caption="🖼️ QR Code eSIM"
+                )
+            except:
+                pass
         
         # Kirim ke grup
         grup_text = (
@@ -462,9 +448,6 @@ async def loop_command(update, context):
                 )
                 
                 keyboard_buttons = []
-                keyboard_buttons.append([
-                    InlineKeyboardButton("📋 Salin QR Content", callback_data=f"copy|{qr_content}")
-                ])
                 
                 if qr_image_url:
                     keyboard_buttons.append([
@@ -490,6 +473,17 @@ async def loop_command(update, context):
                             chat_id=chat_id,
                             text=success,
                             reply_markup=keyboard
+                        )
+                    except:
+                        pass
+                
+                # Kirim QR image terpisah
+                if qr_image_url:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=qr_image_url,
+                            caption="🖼️ QR Code eSIM"
                         )
                     except:
                         pass
@@ -545,10 +539,6 @@ async def webhook(request: Request):
             update = Update.de_json(data, telegram_app.bot)
             if update and update.message:
                 await telegram_app.process_update(update)
-        elif "callback_query" in data:
-            update = Update.de_json(data, telegram_app.bot)
-            if update and update.callback_query:
-                await telegram_app.process_update(update)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
     return {"status": "ok"}
@@ -564,7 +554,6 @@ async def startup_event():
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("loop", loop_command))
     telegram_app.add_handler(CommandHandler("stop", stop_command))
-    telegram_app.add_handler(CallbackQueryHandler(button_callback))
     await telegram_app.initialize()
     await telegram_app.start()
     logger.info("Bot ready!")
