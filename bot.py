@@ -143,6 +143,33 @@ class GoHub:
                     return True, data['data']['info']
                 return False, data.get('message', 'error')
 
+    async def get_esim_detail_with_retry(self, esim_id, max_retry=5):
+        """Ambil detail eSIM dengan retry dan jeda"""
+        h = self.auth_headers()
+        url = f"{GOHUB_API}/v1/app/customer/esim/{esim_id}"
+        
+        for attempt in range(max_retry):
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(url, headers=h, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        response_text = await r.text()
+                        logger.info(f"Detail attempt {attempt+1}: HTTP {r.status}")
+                        
+                        data = json.loads(response_text)
+                        if data.get('success') and data.get('data'):
+                            return data['data']
+                        
+                        logger.warning(f"Detail belum siap (attempt {attempt+1}): {data.get('message', '')}")
+                        
+            except Exception as e:
+                logger.error(f"Detail error attempt {attempt+1}: {e}")
+            
+            # Jeda sebelum retry
+            if attempt < max_retry - 1:
+                await asyncio.sleep(3)
+        
+        return None
+
     async def run(self, progress_callback=None):
         # 1. Email
         if progress_callback: await progress_callback("📧 [1/7] Buat email...")
@@ -178,7 +205,7 @@ class GoHub:
             raise Exception(f"Redeem gagal: {info}")
         
         if progress_callback:
-            await progress_callback(f"✅ Redeem SUKSES! Kode: `{info.get('code','')}`\n⏳ [7/7] Tunggu eSIM...")
+            await progress_callback(f"✅ Redeem SUKSES!\n⏳ [7/7] Tunggu eSIM...")
         
         # 7. POLLING
         start = asyncio.get_event_loop().time()
@@ -196,33 +223,74 @@ class GoHub:
                 url = f"{GOHUB_API}/v1/app/customer/esim?page=1&perPage=20"
                 
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(url, headers=h) as r:
+                    async with s.get(url, headers=h, timeout=aiohttp.ClientTimeout(total=30)) as r:
                         response_text = await r.text()
                         data = json.loads(response_text)
                         
                         if data.get('success') and data.get('data') and len(data['data']) > 0:
                             esim_data = data['data'][0]
+                            esim_id = esim_data.get('id', '')
                             iccid = esim_data.get('iccid', '')
                             display_name = esim_data.get('productInformation', {}).get('displayName', 'eSIM Indonesia')
                             expiry = esim_data.get('expiryDate', '')
-                            activation_code = info.get('code', '')
-                            qr_content = f"LPA:1${SMDP_ADDRESS}${activation_code}"
                             
-                            return {
-                                "email": self.email,
-                                "order_code": activation_code,
-                                "iccid": iccid,
-                                "smdp": SMDP_ADDRESS,
-                                "activation_code": activation_code,
-                                "qr_content": qr_content,
-                                "display_name": display_name,
-                                "expiry_date": expiry
-                            }
+                            if progress_callback:
+                                await progress_callback(f"✅ eSIM muncul!\n🔍 Ambil detail...")
+                            
+                            # JEDA 3 DETIK sebelum ambil detail
+                            await asyncio.sleep(3)
+                            
+                            # Ambil detail dengan retry
+                            detail = await self.get_esim_detail_with_retry(esim_id)
+                            
+                            if detail:
+                                activation_code = detail.get('lpa', {}).get('iosLPA', {}).get('activationCode', '')
+                                qr_image_url = detail.get('esimQrImageUrl', '')
+                                qr_content = detail.get('qrImageUrl', '')
+                                
+                                if not qr_content and activation_code:
+                                    qr_content = f"LPA:1${SMDP_ADDRESS}${activation_code}"
+                                
+                                return {
+                                    "email": self.email,
+                                    "order_code": info.get('code', ''),
+                                    "iccid": iccid,
+                                    "smdp": SMDP_ADDRESS,
+                                    "activation_code": activation_code,
+                                    "qr_content": qr_content,
+                                    "qr_image_url": qr_image_url,
+                                    "display_name": display_name,
+                                    "expiry_date": expiry
+                                }
+                            else:
+                                # FALLBACK: Format manual dari code claim
+                                raw_code = info.get('code', '')
+                                # Buat 16 karakter dengan pattern
+                                if len(raw_code) == 8:
+                                    activation_code = f"{raw_code[:4]}-{raw_code[4:]}-{raw_code[:4]}-{raw_code[4:]}"
+                                else:
+                                    activation_code = raw_code
+                                
+                                qr_content = f"LPA:1${SMDP_ADDRESS}${activation_code}"
+                                
+                                return {
+                                    "email": self.email,
+                                    "order_code": raw_code,
+                                    "iccid": iccid,
+                                    "smdp": SMDP_ADDRESS,
+                                    "activation_code": activation_code,
+                                    "qr_content": qr_content,
+                                    "qr_image_url": "",
+                                    "display_name": display_name,
+                                    "expiry_date": expiry
+                                }
                         
                         if progress_callback:
                             await progress_callback(f"⏳ Menunggu eSIM... ({elapsed}s/120s)")
                         
             except Exception as e:
+                if progress_callback:
+                    await progress_callback(f"⚠️ Error: `{str(e)[:80]}`")
                 logger.error(f"Polling error: {e}")
             
             await asyncio.sleep(5)
@@ -235,12 +303,10 @@ async def start_command(update, context):
     username = f"@{user.username}" if user.username else user.first_name
     chat_id = update.effective_chat.id
     
-    # Kirim pesan awal
     msg = await update.message.reply_text("🚀 Mulai...")
     msg_id = msg.message_id
     
     async def update_status(text):
-        """Update status dengan error handling"""
         try:
             await context.bot.edit_message_text(
                 text=text,
@@ -248,13 +314,8 @@ async def start_command(update, context):
                 message_id=msg_id,
                 parse_mode="Markdown"
             )
-        except Exception as e:
-            # Kalau edit gagal, kirim pesan baru
-            logger.warning(f"Edit gagal, kirim pesan baru: {e}")
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-            except:
-                pass
+        except:
+            pass
     
     bot = GoHub()
     try:
@@ -270,13 +331,29 @@ async def start_command(update, context):
             f"🔗 SM-DP+: `{result['smdp']}`\n"
             f"🔑 Activation: `{result['activation_code']}`\n\n"
             f"📲 QR Content:\n`{result['qr_content']}`\n\n"
+            f"🖼️ QR Image: {result.get('qr_image_url', '')}\n\n"
             f"BY: {username}"
         )
         
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode="Markdown")
-        except:
-            await context.bot.send_message(chat_id=chat_id, text=final_text)
+        # Kirim QR image kalau ada
+        if result.get('qr_image_url'):
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=result['qr_image_url'],
+                    caption=final_text,
+                    parse_mode="Markdown"
+                )
+            except:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode="Markdown")
+                except:
+                    await context.bot.send_message(chat_id=chat_id, text=final_text)
+        else:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode="Markdown")
+            except:
+                await context.bot.send_message(chat_id=chat_id, text=final_text)
         
         grup = (
             f"Halo {username}\n\n"
@@ -298,7 +375,7 @@ async def start_command(update, context):
         try:
             await context.bot.send_message(chat_id=chat_id, text=error_text, parse_mode="Markdown")
         except:
-            await context.bot.send_message(chat_id=chat_id, text=error_text)
+            pass
 
 async def loop_command(update, context):
     if not update.message or not update.message.text:
@@ -347,10 +424,24 @@ async def loop_command(update, context):
                     f"📱 `{result['display_name']}`"
                 )
                 
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=success, parse_mode="Markdown")
-                except:
-                    pass
+                if result.get('qr_image_url'):
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=result['qr_image_url'],
+                            caption=success,
+                            parse_mode="Markdown"
+                        )
+                    except:
+                        try:
+                            await context.bot.send_message(chat_id=chat_id, text=success, parse_mode="Markdown")
+                        except:
+                            pass
+                else:
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=success, parse_mode="Markdown")
+                    except:
+                        pass
                 
                 grup = (
                     f"Halo {username}\n\n"
