@@ -6,7 +6,6 @@ import re
 import uuid
 import json
 import aiohttp
-import subprocess
 import logging
 from datetime import datetime
 from fastapi import FastAPI, Request, Response
@@ -25,6 +24,7 @@ active_loops = set()
 
 GOHUB_API = "https://api.gohub.com"
 ITEM_CODE = "BUTECIDN3DF3HM0100"
+SMDP_ADDRESS = "hthk.esimcase.com"  # Dari sniffing
 
 class GoHub:
     def __init__(self):
@@ -143,41 +143,6 @@ class GoHub:
                     return True, data['data']['info']
                 return False, data.get('message', 'error')
 
-    async def get_esim_detail_curl(self, esim_id):
-        """Fallback pakai curl kalau aiohttp gagal"""
-        try:
-            auth_header = f"authorization: Bearer {self.access_token}"
-            cookie_header = f"cookie: sid={self.access_token}"
-            session_header = f"x-session-id: {self.session_id}"
-            app_header = "x-app-id: gohub-app"
-            ua_header = "user-agent: Dart/3.12 (dart:io)"
-            host_header = "host: api.gohub.com"
-            
-            url = f"{GOHUB_API}/v1/app/customer/esim/{esim_id}"
-            
-            result = subprocess.run(
-                ["curl", "-s", url,
-                 "-H", auth_header,
-                 "-H", cookie_header,
-                 "-H", session_header,
-                 "-H", app_header,
-                 "-H", ua_header,
-                 "-H", host_header,
-                 "--max-time", "30"],
-                capture_output=True, text=True, timeout=35
-            )
-            
-            if result.returncode == 0 and result.stdout:
-                data = json.loads(result.stdout)
-                if data.get('success'):
-                    return data['data']
-            
-            logger.error(f"Curl failed: {result.stderr}")
-            return None
-        except Exception as e:
-            logger.error(f"Curl exception: {e}")
-            return None
-
     async def run(self, update_status=None):
         # 1. Email
         if update_status: await update_status("📧 [1/7] Buat email...")
@@ -215,7 +180,7 @@ class GoHub:
         if update_status:
             await update_status(f"✅ Redeem SUKSES! Kode: `{info.get('code','')}`\n⏳ [7/7] Tunggu eSIM...")
         
-        # 7. POLLING
+        # 7. POLLING eSIM LIST
         start = asyncio.get_event_loop().time()
         attempt = 0
         
@@ -231,62 +196,50 @@ class GoHub:
                 url = f"{GOHUB_API}/v1/app/customer/esim?page=1&perPage=20"
                 
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(url, headers=h, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    async with s.get(url, headers=h) as r:
                         response_text = await r.text()
                         data = json.loads(response_text)
                         
                         if data.get('success') and data.get('data') and len(data['data']) > 0:
                             esim_data = data['data'][0]
-                            esim_id = esim_data.get('id')
+                            esim_id = esim_data.get('id', '')
                             iccid = esim_data.get('iccid', '')
+                            display_name = esim_data.get('productInformation', {}).get('displayName', 'eSIM Indonesia')
+                            expiry = esim_data.get('expiryDate', '')
+                            
+                            # Activation code dari claim response
+                            activation_code = info.get('code', '')
+                            
+                            # QR Content format LPA
+                            qr_content = f"LPA:1${SMDP_ADDRESS}${activation_code}"
+                            
+                            # QR Image URL (pakai S3 pattern dari sniffing)
+                            # Kita gak bisa generate persis, tapi ini formatnya
+                            qr_image_url = ""  # Kosongkan, nanti user bisa scan dari QR content
                             
                             if update_status:
-                                await update_status(f"✅ eSIM muncul!\nID: `{esim_id}`\nICCID: `{iccid}`")
+                                await update_status(
+                                    f"✅ **eSIM BERHASIL DIBUAT!**\n\n"
+                                    f"📧 `{self.email}`\n"
+                                    f"📦 `{activation_code}`\n"
+                                    f"💳 `{iccid}`\n"
+                                    f"📱 `{display_name}`\n\n"
+                                    f"🔗 SM-DP+: `{SMDP_ADDRESS}`\n"
+                                    f"🔑 Activation: `{activation_code}`\n\n"
+                                    f"📲 QR Content:\n`{qr_content}`"
+                                )
                             
-                            # Coba ambil detail via aiohttp dulu
-                            detail = None
-                            try:
-                                async with aiohttp.ClientSession() as s2:
-                                    async with s2.get(
-                                        f"{GOHUB_API}/v1/app/customer/esim/{esim_id}",
-                                        headers=h,
-                                        timeout=aiohttp.ClientTimeout(total=30)
-                                    ) as r2:
-                                        detail_text = await r2.text()
-                                        detail_data = json.loads(detail_text)
-                                        if detail_data.get('success'):
-                                            detail = detail_data['data']
-                            except Exception as e:
-                                logger.error(f"Detail aiohttp gagal: {e}")
-                            
-                            # Fallback curl
-                            if not detail:
-                                if update_status:
-                                    await update_status("🔄 Coba fallback curl...")
-                                detail = await self.get_esim_detail_curl(esim_id)
-                            
-                            if detail:
-                                return {
-                                    "email": self.email,
-                                    "order_code": info.get('code', ''),
-                                    "iccid": detail.get('iccid', iccid),
-                                    "qr_image_url": detail.get('esimQrImageUrl', ''),
-                                    "smdp": detail.get('lpa', {}).get('iosLPA', {}).get('smdp', ''),
-                                    "activation_code": detail.get('lpa', {}).get('iosLPA', {}).get('activationCode', ''),
-                                    "qr_content": detail.get('qrImageUrl', ''),
-                                    "display_name": detail.get('productInformation', {}).get('displayName', '')
-                                }
-                            
-                            # Kalau detail gagal total, return data dari list
                             return {
                                 "email": self.email,
-                                "order_code": info.get('code', ''),
+                                "order_code": activation_code,
                                 "iccid": iccid,
-                                "qr_image_url": "",
-                                "smdp": "hthk.esimcase.com",
-                                "activation_code": info.get('code', ''),
-                                "qr_content": f"LPA:1$hthk.esimcase.com${info.get('code', '')}",
-                                "display_name": "eSIM Indonesia 300MB 1 Day(s)"
+                                "qr_image_url": qr_image_url,
+                                "smdp": SMDP_ADDRESS,
+                                "activation_code": activation_code,
+                                "qr_content": qr_content,
+                                "display_name": display_name,
+                                "expiry_date": expiry,
+                                "esim_id": esim_id
                             }
                         
                         if update_status:
@@ -319,28 +272,29 @@ async def start_command(update, context):
     try:
         result = await bot.run(update_status)
         
-        success = (
-            f"✅ **BERHASIL!**\n\n"
+        # Final success message
+        final_text = (
+            f"✅ **eSIM BERHASIL!**\n\n"
             f"📧 `{result['email']}`\n"
             f"📦 `{result['order_code']}`\n"
             f"💳 `{result['iccid']}`\n"
-            f"📱 `{result['display_name']}`\n\n"
+            f"📱 `{result['display_name']}`\n"
+            f"📅 `{result['expiry_date']}`\n\n"
             f"🔗 SM-DP+: `{result['smdp']}`\n"
             f"🔑 Activation: `{result['activation_code']}`\n\n"
-            f"📲 QR: {result['qr_image_url']}"
+            f"📲 QR Content:\n`{result['qr_content']}`\n\n"
+            f"BY: {username}"
         )
         
-        if result['qr_image_url']:
-            await context.bot.send_photo(chat_id=chat_id, photo=result['qr_image_url'], caption=success, parse_mode="Markdown")
-        else:
-            await update_status(success)
+        await update_status(final_text)
         
         grup = (
             f"Halo {username}\n\n"
             f"✅ eSIM GoHub berhasil!\n\n"
             f"📧 {result['email']}\n"
             f"💳 {result['iccid']}\n"
-            f"🔑 {result['activation_code']}\n\n"
+            f"🔑 {result['activation_code']}\n"
+            f"📱 {result['display_name']}\n\n"
             f"BY: {username}"
         )
         await context.bot.send_message(chat_id=GROUP_ID, text=grup)
@@ -386,13 +340,10 @@ async def loop_command(update, context):
                     f"📧 `{result['email']}`\n"
                     f"💳 `{result['iccid']}`\n"
                     f"🔑 `{result['activation_code']}`\n"
-                    f"📲 {result['qr_image_url']}"
+                    f"📱 `{result['display_name']}`"
                 )
                 
-                if result['qr_image_url']:
-                    await context.bot.send_photo(chat_id=chat_id, photo=result['qr_image_url'], caption=success, parse_mode="Markdown")
-                else:
-                    await update_status(success)
+                await update_status(success)
                 
                 grup = (
                     f"Halo {username}\n\n"
