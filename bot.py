@@ -1,0 +1,555 @@
+import os
+import random
+import string
+import asyncio
+import re
+import uuid
+import aiohttp
+import logging
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request, Response
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+TOKEN = "8824915756:AAEYK27n7r3uLATXvJo8yej9A-iuF6ZDHmo"
+GROUP_ID = -1004339334563
+ADMIN_ID = 6790347169
+
+app = FastAPI()
+telegram_app = None
+active_loops = set()
+
+# Konfigurasi GoHub API
+GOHUB_API = "https://api.gohub.com"
+GOHUB_PARTNER_CODE = "APPFREE"
+GOHUB_ITEM_CODE = "BUTECIDN3DF3HM0100"  # eSIM Indonesia 300MB 1 Day
+RATE_LIMIT = 60  # Rate limit per window
+RATE_LIMIT_WINDOW = 3600  # 1 jam dalam detik
+
+class GoHubBot:
+    def __init__(self):
+        self.base_url = GOHUB_API
+        self.email = ""
+        self.access_token = ""
+        self.refresh_token = ""
+        self.customer_id = ""
+        self.device_code = ""
+        self.fcm_token = ""
+        self.session_id = ""
+        self.esim_details = []
+
+    def generate_session_id(self):
+        """Generate x-session-id seperti format sniff"""
+        timestamp = int(datetime.now().timestamp() * 1000)
+        random_suffix = random.randint(100, 999)
+        return f"{timestamp}_{random_suffix}"
+
+    def generate_device_name(self):
+        """Generate nama device random"""
+        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+    def generate_fcm_token(self):
+        """Generate FCM token format"""
+        random_part = ''.join(random.choices(string.ascii_letters + string.digits, k=22))
+        return f"f{random_part}:APA91b{''.join(random.choices(string.ascii_letters + string.digits + '-_', k=134))}"
+
+    async def create_mailtm_account(self):
+        """Buat akun Mail.tm untuk terima OTP"""
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.mail.tm/domains") as r:
+                domains = await r.json()
+                domain = domains['hydra:member'][0]['domain']
+                user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                self.email = f"{user}@{domain}"
+            
+            payload = {"address": self.email, "password": "Password123!"}
+            await session.post("https://api.mail.tm/accounts", json=payload)
+            async with session.post("https://api.mail.tm/token", json=payload) as r:
+                data = await r.json()
+                mail_token = data.get('token', '')
+        
+        logger.info(f"Mail.tm account created: {self.email}")
+        return mail_token
+
+    async def fetch_otp_from_email(self, mail_token, timeout=90):
+        """Ambil OTP dari email Mail.tm"""
+        headers = {"Authorization": f"Bearer {mail_token}"}
+        start_time = asyncio.get_event_loop().time()
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
+            while (asyncio.get_event_loop().time() - start_time) < timeout:
+                try:
+                    async with session.get("https://api.mail.tm/messages") as r:
+                        data = await r.json()
+                        if data.get('hydra:totalItems', 0) > 0:
+                            for msg in data['hydra:member']:
+                                msg_id = msg['id']
+                                async with session.get(f"https://api.mail.tm/messages/{msg_id}") as r2:
+                                    msg_detail = await r2.json()
+                                    raw_text = msg_detail.get('text', '') or ''
+                                    raw_html = msg_detail.get('html', '') or ''
+                                    subject = msg_detail.get('subject', '') or ''
+                                    
+                                    if isinstance(raw_text, list):
+                                        raw_text = "\n".join(str(x) for x in raw_text)
+                                    if isinstance(raw_html, list):
+                                        raw_html = "\n".join(str(x) for x in raw_html)
+                                    if isinstance(subject, list):
+                                        subject = " ".join(str(x) for x in subject)
+
+                                    combined = f"{subject} {raw_text} {raw_html}"
+                                    
+                                    # Cari OTP 6 digit
+                                    match = re.search(r'(?:otp|code|verification)[:\s\-]*([0-9]{6})', combined, re.IGNORECASE)
+                                    if match:
+                                        return match.group(1).strip()
+                                    
+                                    # Fallback: cari 6 digit angka
+                                    words = re.findall(r'\b[0-9]{6}\b', combined)
+                                    if words:
+                                        return words[0]
+                except Exception as e:
+                    logger.error(f"Error fetching OTP: {e}")
+                await asyncio.sleep(1)
+        return None
+
+    async def request_otp(self):
+        """Request OTP ke GoHub"""
+        self.session_id = self.generate_session_id()
+        headers = {
+            "user-agent": "Dart/3.12 (dart:io)",
+            "x-session-id": self.session_id,
+            "x-app-id": "gohub-app",
+            "content-type": "application/json"
+        }
+        payload = {
+            "email": self.email,
+            "language": "en",
+            "currency": "USD"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/v1/app/auth/otp/request",
+                json=payload,
+                headers=headers
+            ) as r:
+                data = await r.json()
+                if data.get('success'):
+                    logger.info(f"OTP requested for {self.email}")
+                    return True
+                else:
+                    logger.error(f"Failed to request OTP: {data}")
+                    return False
+
+    async def verify_otp(self, otp_code):
+        """Verify OTP dan dapatkan token"""
+        headers = {
+            "user-agent": "Dart/3.12 (dart:io)",
+            "x-session-id": self.session_id,
+            "x-app-id": "gohub-app",
+            "content-type": "application/json"
+        }
+        payload = {
+            "email": self.email,
+            "code": otp_code
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/v1/app/auth/otp/verify",
+                json=payload,
+                headers=headers
+            ) as r:
+                data = await r.json()
+                if data.get('success'):
+                    self.access_token = data['data']['accessToken']
+                    self.refresh_token = data['data']['refreshToken']
+                    self.customer_id = data['data']['customerId']
+                    logger.info(f"OTP verified, customer ID: {self.customer_id}")
+                    return True
+                else:
+                    logger.error(f"Failed to verify OTP: {data}")
+                    return False
+
+    async def register_device(self):
+        """Register device ke GoHub"""
+        self.device_code = str(uuid.uuid4())
+        self.fcm_token = self.generate_fcm_token()
+        device_name = self.generate_device_name()
+        
+        headers = {
+            "user-agent": "Dart/3.12 (dart:io)",
+            "x-session-id": self.session_id,
+            "x-app-id": "gohub-app",
+            "content-type": "application/json"
+        }
+        payload = {
+            "deviceCode": self.device_code,
+            "fcmToken": self.fcm_token,
+            "name": device_name,
+            "customerId": self.customer_id
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/v1/app/auth/device/register",
+                json=payload,
+                headers=headers
+            ) as r:
+                data = await r.json()
+                if data.get('success'):
+                    logger.info(f"Device registered: {device_name}")
+                    return True
+                else:
+                    logger.error(f"Failed to register device: {data}")
+                    return False
+
+    def get_headers_with_auth(self):
+        """Dapatkan headers dengan authentication"""
+        return {
+            "user-agent": "Dart/3.12 (dart:io)",
+            "x-session-id": self.session_id,
+            "x-app-id": "gohub-app",
+            "authorization": f"Bearer {self.access_token}",
+            "content-type": "application/json"
+        }
+
+    async def claim_esim(self):
+        """Claim eSIM dari GoHub"""
+        headers = self.get_headers_with_auth()
+        payload = {
+            "partnerCode": GOHUB_PARTNER_CODE,
+            "itemCode": GOHUB_ITEM_CODE
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/v1/app/redeem/claim",
+                json=payload,
+                headers=headers
+            ) as r:
+                data = await r.json()
+                if data.get('success'):
+                    order_info = data['data']['info']
+                    logger.info(f"eSIM claimed! Code: {order_info['code']}")
+                    return order_info
+                else:
+                    logger.error(f"Failed to claim eSIM: {data}")
+                    return None
+
+    async def get_esim_list(self):
+        """Dapatkan daftar eSIM customer"""
+        headers = self.get_headers_with_auth()
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.base_url}/v1/app/customer/esim?page=1&perPage=20",
+                headers=headers
+            ) as r:
+                data = await r.json()
+                if data.get('success'):
+                    return data['data']
+                else:
+                    logger.error(f"Failed to get eSIM list: {data}")
+                    return []
+
+    async def get_esim_detail(self, esim_id):
+        """Dapatkan detail eSIM termasuk QR code"""
+        headers = self.get_headers_with_auth()
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.base_url}/v1/app/customer/esim/{esim_id}",
+                headers=headers
+            ) as r:
+                data = await r.json()
+                if data.get('success'):
+                    return data['data']
+                else:
+                    logger.error(f"Failed to get eSIM detail: {data}")
+                    return None
+
+    async def full_registration_flow(self, status_callback=None):
+        """Jalankan seluruh flow registrasi"""
+        try:
+            # Step 1: Buat akun Mail.tm
+            if status_callback:
+                await status_callback("📧 [1/7] Membuat akun email sementara...")
+            mail_token = await self.create_mailtm_account()
+            
+            # Step 2: Request OTP
+            if status_callback:
+                await status_callback(f"📤 [2/7] Request OTP ke `{self.email}`...")
+            if not await self.request_otp():
+                raise Exception("Gagal request OTP")
+            
+            # Step 3: Fetch OTP dari email
+            if status_callback:
+                await status_callback("⏳ [3/7] Menunggu OTP masuk...")
+            otp = await self.fetch_otp_from_email(mail_token)
+            if not otp:
+                raise Exception("OTP timeout")
+            
+            # Step 4: Verify OTP
+            if status_callback:
+                await status_callback(f"🔐 [4/7] Verify OTP: `{otp}`...")
+            if not await self.verify_otp(otp):
+                raise Exception("Gagal verify OTP")
+            
+            # Step 5: Register device
+            if status_callback:
+                await status_callback("📱 [5/7] Register device...")
+            if not await self.register_device():
+                raise Exception("Gagal register device")
+            
+            # Step 6: Claim eSIM
+            if status_callback:
+                await status_callback("🎁 [6/7] Claim eSIM...")
+            order_info = await self.claim_esim()
+            if not order_info:
+                raise Exception("Gagal claim eSIM")
+            
+            # Step 7: Get eSIM detail
+            if status_callback:
+                await status_callback("📋 [7/7] Mengambil detail eSIM...")
+            await asyncio.sleep(3)  # Tunggu eSIM diproses
+            
+            esim_list = await self.get_esim_list()
+            if not esim_list:
+                raise Exception("Gagal mengambil daftar eSIM")
+            
+            # Ambil eSIM terbaru
+            latest_esim = esim_list[0]
+            esim_detail = await self.get_esim_detail(latest_esim['id'])
+            if not esim_detail:
+                raise Exception("Gagal mengambil detail eSIM")
+            
+            # Format output
+            result = {
+                "email": self.email,
+                "customer_id": self.customer_id,
+                "device_code": self.device_code,
+                "order_code": order_info['code'],
+                "iccid": esim_detail['iccid'],
+                "qr_image_url": esim_detail.get('esimQrImageUrl', ''),
+                "lpa": esim_detail.get('lpa', {}),
+                "smdp": esim_detail.get('lpa', {}).get('iosLPA', {}).get('smdp', ''),
+                "activation_code": esim_detail.get('lpa', {}).get('iosLPA', {}).get('activationCode', ''),
+                "qr_content": esim_detail.get('qrImageUrl', ''),
+                "display_name": esim_detail.get('productInformation', {}).get('displayName', ''),
+                "expiry_date": esim_detail.get('expiryDate', ''),
+                "created_at": esim_detail.get('createdAt', '')
+            }
+            
+            logger.info(f"Full flow completed! ICCID: {result['iccid']}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in full flow: {e}")
+            raise e
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk /start"""
+    if not update.message or not update.message.text:
+        return
+    
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else user.first_name
+    chat_id = update.effective_chat.id
+    
+    msg = await update.message.reply_text("🚀 Bot GoHub eSIM aktif! Memproses klaim...")
+    
+    async def update_status(text):
+        try:
+            await context.bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    
+    bot = GoHubBot()
+    try:
+        result = await bot.full_registration_flow(update_status)
+        
+        # Format pesan sukses
+        success_text = (
+            f"✅ **eSIM BERHASIL DIBUAT!**\n\n"
+            f"📧 Email: `{result['email']}`\n"
+            f"🆔 Customer ID: `{result['customer_id']}`\n"
+            f"📦 Order Code: `{result['order_code']}`\n"
+            f"💳 ICCID: `{result['iccid']}`\n"
+            f"📱 Produk: `{result['display_name']}`\n"
+            f"📅 Expiry: `{result['expiry_date']}`\n\n"
+            f"🔗 **SM-DP+ Address:** `{result['smdp']}`\n"
+            f"🔑 **Activation Code:** `{result['activation_code']}`\n\n"
+            f"📲 **QR Content:**\n`{result['qr_content']}`\n\n"
+            f"🖼️ QR Image: {result['qr_image_url']}\n\n"
+            f"CREATED BY: {username}\n"
+            f"Bot: @kopikapal1"
+        )
+        
+        # Kirim QR code jika ada
+        if result['qr_image_url']:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=result['qr_image_url'],
+                caption=success_text,
+                parse_mode="Markdown"
+            )
+        else:
+            await update_status(success_text)
+        
+        # Kirim ke grup
+        grup_text = (
+            f"Halo {username}\n\n"
+            f"✅ eSIM GoHub berhasil dibuat!\n\n"
+            f"📧 Email: {result['email']}\n"
+            f"💳 ICCID: {result['iccid']}\n"
+            f"🔑 Activation Code: {result['activation_code']}\n"
+            f"📱 Produk: {result['display_name']}\n\n"
+            f"CREATED BY: {username}"
+        )
+        await context.bot.send_message(chat_id=GROUP_ID, text=grup_text)
+        
+    except Exception as e:
+        error_text = f"❌ **Gagal Memproses:**\n`{str(e)}`"
+        await update_status(error_text)
+
+async def loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk /loop"""
+    if not update.message or not update.message.text:
+        return
+    
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else user.first_name
+    chat_id = update.effective_chat.id
+    
+    if chat_id in active_loops:
+        await update.message.reply_text("⚠️ Looping sudah berjalan di chat ini.")
+        return
+    
+    active_loops.add(chat_id)
+    success_count = 0
+    target_success = 50
+    
+    await update.message.reply_text(
+        f"🔄 **Looping GoHub eSIM Dimulai!**\n"
+        f"Target: {target_success} kali berhasil\n"
+        f"Kirim /stop untuk menghentikan."
+    )
+    
+    while chat_id in active_loops and success_count < target_success:
+        msg = await update.message.reply_text(f"🚀 [Loop ke-{success_count + 1}] Memproses klaim...")
+        
+        async def update_status(text):
+            try:
+                await context.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        
+        bot = GoHubBot()
+        try:
+            result = await bot.full_registration_flow(update_status)
+            
+            if result and result.get('iccid'):
+                success_count += 1
+                success_text = (
+                    f"✅ **[BERHASIL {success_count}/{target_success}]**\n\n"
+                    f"📧 Email: `{result['email']}`\n"
+                    f"💳 ICCID: `{result['iccid']}`\n"
+                    f"🔑 Activation: `{result['activation_code']}`\n"
+                    f"📱 Produk: `{result['display_name']}`\n\n"
+                    f"🔗 SM-DP+: `{result['smdp']}`\n\n"
+                    f"📲 QR: {result['qr_image_url']}"
+                )
+                
+                if result['qr_image_url']:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=result['qr_image_url'],
+                        caption=success_text,
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await update_status(success_text)
+                
+                # Kirim ke grup
+                grup_text = (
+                    f"Halo {username}\n\n"
+                    f"✅ GoHub eSIM berhasil! (Loop ke-{success_count})\n\n"
+                    f"📧 Email: {result['email']}\n"
+                    f"💳 ICCID: {result['iccid']}\n"
+                    f"🔑 Activation: {result['activation_code']}\n"
+                    f"📱 Produk: {result['display_name']}\n\n"
+                    f"CREATED BY: {username}"
+                )
+                await context.bot.send_message(chat_id=GROUP_ID, text=grup_text)
+            else:
+                raise Exception("Hasil tidak valid")
+                
+        except Exception as e:
+            error_text = f"❌ **Gagal di Loop {success_count + 1}:**\n`{str(e)}`\nMelanjutkan..."
+            await update_status(error_text)
+        
+        if chat_id in active_loops and success_count < target_success:
+            # Rate limit protection - tunggu sesuai rate limit
+            await asyncio.sleep(3)
+    
+    if chat_id in active_loops:
+        active_loops.remove(chat_id)
+    
+    await update.message.reply_text(f"🏁 **Looping Selesai!** Berhasil: {success_count} eSIM")
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk /stop"""
+    chat_id = update.effective_chat.id
+    if chat_id in active_loops:
+        active_loops.remove(chat_id)
+        await update.message.reply_text("🛑 Looping dihentikan!")
+    else:
+        await update.message.reply_text("⚠️ Tidak ada looping aktif.")
+
+# Webhook endpoint
+@app.post("/")
+async def webhook(request: Request):
+    global telegram_app
+    try:
+        data = await request.json()
+        if "message" in data and "text" in data["message"]:
+            update = Update.de_json(data, telegram_app.bot)
+            if update and update.message:
+                await telegram_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+    return {"status": "ok"}
+
+@app.get("/")
+async def health_check():
+    return Response(content="GoHub eSIM Bot is running!", status_code=200)
+
+@app.on_event("startup")
+async def startup_event():
+    global telegram_app
+    telegram_app = Application.builder().token(TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("loop", loop_command))
+    telegram_app.add_handler(CommandHandler("stop", stop_command))
+    await telegram_app.initialize()
+    await telegram_app.start()
+    logger.info("GoHub eSIM Bot ready!")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
