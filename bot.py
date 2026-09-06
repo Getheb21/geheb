@@ -184,7 +184,7 @@ class GoHub:
             raise Exception("OTP timeout")
         
         # 4. Verify
-        if progress_callback: await progress_callback(f"🔐 [4/7] Verify: `{otp}`")
+        if progress_callback: await progress_callback(f"🔐 [4/7] Verify: {otp}")
         if not await self.verify_otp(otp):
             raise Exception("Verify gagal")
         
@@ -198,7 +198,7 @@ class GoHub:
         ok, info = await self.claim()
         
         if not ok:
-            if progress_callback: await progress_callback(f"❌ Redeem GAGAL: `{info}`")
+            if progress_callback: await progress_callback(f"❌ Redeem GAGAL: {info}")
             raise Exception(f"Redeem gagal: {info}")
         
         if progress_callback:
@@ -283,22 +283,29 @@ class GoHub:
                         
             except Exception as e:
                 if progress_callback:
-                    await progress_callback(f"⚠️ Error: `{str(e)[:80]}`")
+                    await progress_callback(f"⚠️ Error: {str(e)[:80]}")
                 logger.error(f"Polling error: {e}")
             
             await asyncio.sleep(5)
 
-def build_result_keyboard(qr_content):
-    """Build inline keyboard dengan tombol salin QR content dan QRIS"""
-    keyboard = [
-        [
-            InlineKeyboardButton("📋 Salin QR Content", callback_data=f"copy|{qr_content[:50]}")
-        ],
-        [
-            InlineKeyboardButton("💳 QRIS Donasi", url="https://t.me/kopi_kapal1")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+async def button_callback(update, context):
+    """Handle inline button callback"""
+    query = update.callback_query
+    
+    if query.data.startswith("copy|"):
+        qr_content = query.data.split("|", 1)[1]
+        
+        await query.answer("QR Content berhasil disalin!")
+        
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"📋 QR Content:\n\n{qr_content}"
+            )
+        except:
+            pass
+    
+    await query.answer()
 
 async def start_command(update, context):
     if not update.message or not update.message.text:
@@ -327,64 +334,57 @@ async def start_command(update, context):
         result = await bot.run(update_status)
         
         qr_content = result['qr_content']
+        qr_image_url = result.get('qr_image_url', '')
         
+        # Text TANPA backtick untuk QR content
         final_text = (
             f"✅ **eSIM BERHASIL!**\n\n"
-            f"📧 `{result['email']}`\n"
-            f"📦 `{result['order_code']}`\n"
-            f"💳 `{result['iccid']}`\n"
-            f"📱 `{result['display_name']}`\n"
-            f"📅 `{result['expiry_date']}`\n\n"
-            f"🔗 SM-DP+: `{result['smdp']}`\n"
-            f"🔑 Activation: `{result['activation_code']}`\n\n"
-            f"📲 QR Content:\n`{qr_content}`\n\n"
+            f"📧 {result['email']}\n"
+            f"📦 {result['order_code']}\n"
+            f"💳 {result['iccid']}\n"
+            f"📱 {result['display_name']}\n"
+            f"📅 {result['expiry_date']}\n\n"
+            f"🔗 SM-DP+: {result['smdp']}\n"
+            f"🔑 Activation: {result['activation_code']}\n\n"
+            f"📲 QR Content:\n{qr_content}\n\n"
             f"BY: {username}"
         )
         
         # Keyboard
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Salin QR Content", callback_data=f"copy|{qr_content}")],
-            [InlineKeyboardButton("💳 QRIS Donasi", url=QRIS_URL)]
+        keyboard_buttons = []
+        
+        # Tombol salin QR content
+        keyboard_buttons.append([
+            InlineKeyboardButton("📋 Salin QR Content", callback_data=f"copy|{qr_content}")
         ])
         
-        # Kirim QR image + text dengan keyboard
-        if result.get('qr_image_url'):
-            try:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=result['qr_image_url'],
-                    caption=final_text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
-            except:
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=final_text,
-                        parse_mode="Markdown",
-                        reply_markup=keyboard
-                    )
-                except:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=final_text,
-                        reply_markup=keyboard
-                    )
-        else:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=final_text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
-            except:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=final_text,
-                    reply_markup=keyboard
-                )
+        # Tombol QR Image (kalau ada)
+        if qr_image_url:
+            keyboard_buttons.append([
+                InlineKeyboardButton("🖼️ Buka QR Image", url=qr_image_url)
+            ])
+        
+        # Tombol QRIS Donasi
+        keyboard_buttons.append([
+            InlineKeyboardButton("💳 QRIS Donasi", url=QRIS_URL)
+        ])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        
+        # Kirim pesan
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=final_text,
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+        except:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=final_text,
+                reply_markup=keyboard
+            )
         
         # Kirim ke grup
         grup_text = (
@@ -403,35 +403,11 @@ async def start_command(update, context):
             pass
         
     except Exception as e:
-        error_text = f"❌ **Gagal:**\n`{str(e)}`"
+        error_text = f"❌ **Gagal:**\n{str(e)}"
         try:
             await context.bot.send_message(chat_id=chat_id, text=error_text, parse_mode="Markdown")
         except:
             pass
-
-async def button_callback(update, context):
-    """Handle inline button callback"""
-    query = update.callback_query
-    
-    if query.data.startswith("copy|"):
-        qr_content = query.data.split("|", 1)[1]
-        
-        # Kirim sebagai pesan yang bisa di-copy
-        await query.answer("QR Content berhasil disalin!")
-        
-        try:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"📋 **QR Content:**\n`{qr_content}`",
-                parse_mode="Markdown"
-            )
-        except:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"📋 QR Content:\n{qr_content}"
-            )
-    
-    await query.answer()
 
 async def loop_command(update, context):
     if not update.message or not update.message.text:
@@ -474,46 +450,45 @@ async def loop_command(update, context):
                 success_count += 1
                 
                 qr_content = result['qr_content']
+                qr_image_url = result.get('qr_image_url', '')
                 
                 success = (
                     f"✅ **[{success_count}/{target}]**\n\n"
-                    f"📧 `{result['email']}`\n"
-                    f"💳 `{result['iccid']}`\n"
-                    f"🔑 `{result['activation_code']}`\n"
-                    f"📱 `{result['display_name']}`\n\n"
-                    f"📲 QR Content:\n`{qr_content}`"
+                    f"📧 {result['email']}\n"
+                    f"💳 {result['iccid']}\n"
+                    f"🔑 {result['activation_code']}\n"
+                    f"📱 {result['display_name']}\n\n"
+                    f"📲 QR Content:\n{qr_content}"
                 )
                 
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Salin QR Content", callback_data=f"copy|{qr_content}")],
-                    [InlineKeyboardButton("💳 QRIS Donasi", url=QRIS_URL)]
+                keyboard_buttons = []
+                keyboard_buttons.append([
+                    InlineKeyboardButton("📋 Salin QR Content", callback_data=f"copy|{qr_content}")
                 ])
                 
-                if result.get('qr_image_url'):
-                    try:
-                        await context.bot.send_photo(
-                            chat_id=chat_id,
-                            photo=result['qr_image_url'],
-                            caption=success,
-                            parse_mode="Markdown",
-                            reply_markup=keyboard
-                        )
-                    except:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=success,
-                                parse_mode="Markdown",
-                                reply_markup=keyboard
-                            )
-                        except:
-                            pass
-                else:
+                if qr_image_url:
+                    keyboard_buttons.append([
+                        InlineKeyboardButton("🖼️ Buka QR Image", url=qr_image_url)
+                    ])
+                
+                keyboard_buttons.append([
+                    InlineKeyboardButton("💳 QRIS Donasi", url=QRIS_URL)
+                ])
+                
+                keyboard = InlineKeyboardMarkup(keyboard_buttons)
+                
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=success,
+                        parse_mode="Markdown",
+                        reply_markup=keyboard
+                    )
+                except:
                     try:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=success,
-                            parse_mode="Markdown",
                             reply_markup=keyboard
                         )
                     except:
@@ -536,7 +511,7 @@ async def loop_command(update, context):
                 raise Exception("Hasil tidak valid")
                 
         except Exception as e:
-            error_text = f"❌ **Gagal Loop {success_count + 1}:**\n`{str(e)}`"
+            error_text = f"❌ **Gagal Loop {success_count + 1}:**\n{str(e)}"
             try:
                 await context.bot.send_message(chat_id=chat_id, text=error_text)
             except:
