@@ -24,7 +24,7 @@ active_loops = set()
 
 GOHUB_API = "https://api.gohub.com"
 ITEM_CODE = "BUTECIDN3DF3HM0100"
-SMDP_ADDRESS = "hthk.esimcase.com"  # Dari sniffing
+SMDP_ADDRESS = "hthk.esimcase.com"
 
 class GoHub:
     def __init__(self):
@@ -143,44 +143,44 @@ class GoHub:
                     return True, data['data']['info']
                 return False, data.get('message', 'error')
 
-    async def run(self, update_status=None):
+    async def run(self, progress_callback=None):
         # 1. Email
-        if update_status: await update_status("📧 [1/7] Buat email...")
+        if progress_callback: await progress_callback("📧 [1/7] Buat email...")
         await self.create_email()
         
         # 2. Request OTP
-        if update_status: await update_status(f"📤 [2/7] Request OTP...")
+        if progress_callback: await progress_callback(f"📤 [2/7] Request OTP...")
         if not await self.request_otp():
             raise Exception("Gagal request OTP")
         
         # 3. Get OTP
-        if update_status: await update_status("⏳ [3/7] Tunggu OTP...")
+        if progress_callback: await progress_callback("⏳ [3/7] Tunggu OTP...")
         otp = await self.get_otp()
         if not otp:
             raise Exception("OTP timeout")
         
         # 4. Verify
-        if update_status: await update_status(f"🔐 [4/7] Verify: `{otp}`")
+        if progress_callback: await progress_callback(f"🔐 [4/7] Verify: `{otp}`")
         if not await self.verify_otp(otp):
             raise Exception("Verify gagal")
         
         # 5. Device
-        if update_status: await update_status("📱 [5/7] Register device...")
+        if progress_callback: await progress_callback("📱 [5/7] Register device...")
         if not await self.register_device():
             raise Exception("Device gagal")
         
         # 6. Claim
-        if update_status: await update_status("🎁 [6/7] Claim eSIM...")
+        if progress_callback: await progress_callback("🎁 [6/7] Claim eSIM...")
         ok, info = await self.claim()
         
         if not ok:
-            if update_status: await update_status(f"❌ Redeem GAGAL: `{info}`")
+            if progress_callback: await progress_callback(f"❌ Redeem GAGAL: `{info}`")
             raise Exception(f"Redeem gagal: {info}")
         
-        if update_status:
-            await update_status(f"✅ Redeem SUKSES! Kode: `{info.get('code','')}`\n⏳ [7/7] Tunggu eSIM...")
+        if progress_callback:
+            await progress_callback(f"✅ Redeem SUKSES! Kode: `{info.get('code','')}`\n⏳ [7/7] Tunggu eSIM...")
         
-        # 7. POLLING eSIM LIST
+        # 7. POLLING
         start = asyncio.get_event_loop().time()
         attempt = 0
         
@@ -202,52 +202,27 @@ class GoHub:
                         
                         if data.get('success') and data.get('data') and len(data['data']) > 0:
                             esim_data = data['data'][0]
-                            esim_id = esim_data.get('id', '')
                             iccid = esim_data.get('iccid', '')
                             display_name = esim_data.get('productInformation', {}).get('displayName', 'eSIM Indonesia')
                             expiry = esim_data.get('expiryDate', '')
-                            
-                            # Activation code dari claim response
                             activation_code = info.get('code', '')
-                            
-                            # QR Content format LPA
                             qr_content = f"LPA:1${SMDP_ADDRESS}${activation_code}"
-                            
-                            # QR Image URL (pakai S3 pattern dari sniffing)
-                            # Kita gak bisa generate persis, tapi ini formatnya
-                            qr_image_url = ""  # Kosongkan, nanti user bisa scan dari QR content
-                            
-                            if update_status:
-                                await update_status(
-                                    f"✅ **eSIM BERHASIL DIBUAT!**\n\n"
-                                    f"📧 `{self.email}`\n"
-                                    f"📦 `{activation_code}`\n"
-                                    f"💳 `{iccid}`\n"
-                                    f"📱 `{display_name}`\n\n"
-                                    f"🔗 SM-DP+: `{SMDP_ADDRESS}`\n"
-                                    f"🔑 Activation: `{activation_code}`\n\n"
-                                    f"📲 QR Content:\n`{qr_content}`"
-                                )
                             
                             return {
                                 "email": self.email,
                                 "order_code": activation_code,
                                 "iccid": iccid,
-                                "qr_image_url": qr_image_url,
                                 "smdp": SMDP_ADDRESS,
                                 "activation_code": activation_code,
                                 "qr_content": qr_content,
                                 "display_name": display_name,
-                                "expiry_date": expiry,
-                                "esim_id": esim_id
+                                "expiry_date": expiry
                             }
                         
-                        if update_status:
-                            await update_status(f"⏳ Menunggu eSIM... ({elapsed}s/120s)")
+                        if progress_callback:
+                            await progress_callback(f"⏳ Menunggu eSIM... ({elapsed}s/120s)")
                         
             except Exception as e:
-                if update_status:
-                    await update_status(f"⚠️ Error: `{str(e)[:80]}`")
                 logger.error(f"Polling error: {e}")
             
             await asyncio.sleep(5)
@@ -260,19 +235,31 @@ async def start_command(update, context):
     username = f"@{user.username}" if user.username else user.first_name
     chat_id = update.effective_chat.id
     
+    # Kirim pesan awal
     msg = await update.message.reply_text("🚀 Mulai...")
+    msg_id = msg.message_id
     
     async def update_status(text):
+        """Update status dengan error handling"""
         try:
-            await context.bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg.message_id, parse_mode="Markdown")
-        except:
-            pass
+            await context.bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            # Kalau edit gagal, kirim pesan baru
+            logger.warning(f"Edit gagal, kirim pesan baru: {e}")
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except:
+                pass
     
     bot = GoHub()
     try:
         result = await bot.run(update_status)
         
-        # Final success message
         final_text = (
             f"✅ **eSIM BERHASIL!**\n\n"
             f"📧 `{result['email']}`\n"
@@ -286,7 +273,10 @@ async def start_command(update, context):
             f"BY: {username}"
         )
         
-        await update_status(final_text)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode="Markdown")
+        except:
+            await context.bot.send_message(chat_id=chat_id, text=final_text)
         
         grup = (
             f"Halo {username}\n\n"
@@ -297,10 +287,18 @@ async def start_command(update, context):
             f"📱 {result['display_name']}\n\n"
             f"BY: {username}"
         )
-        await context.bot.send_message(chat_id=GROUP_ID, text=grup)
+        
+        try:
+            await context.bot.send_message(chat_id=GROUP_ID, text=grup)
+        except:
+            pass
         
     except Exception as e:
-        await update_status(f"❌ **Gagal:**\n`{str(e)}`")
+        error_text = f"❌ **Gagal:**\n`{str(e)}`"
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=error_text, parse_mode="Markdown")
+        except:
+            await context.bot.send_message(chat_id=chat_id, text=error_text)
 
 async def loop_command(update, context):
     if not update.message or not update.message.text:
@@ -322,10 +320,16 @@ async def loop_command(update, context):
     
     while chat_id in active_loops and success_count < target:
         msg = await update.message.reply_text(f"🚀 [Loop {success_count + 1}]")
+        msg_id = msg.message_id
         
         async def update_status(text):
             try:
-                await context.bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg.message_id, parse_mode="Markdown")
+                await context.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    parse_mode="Markdown"
+                )
             except:
                 pass
         
@@ -343,7 +347,10 @@ async def loop_command(update, context):
                     f"📱 `{result['display_name']}`"
                 )
                 
-                await update_status(success)
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=success, parse_mode="Markdown")
+                except:
+                    pass
                 
                 grup = (
                     f"Halo {username}\n\n"
@@ -353,12 +360,20 @@ async def loop_command(update, context):
                     f"🔑 {result['activation_code']}\n\n"
                     f"BY: {username}"
                 )
-                await context.bot.send_message(chat_id=GROUP_ID, text=grup)
+                
+                try:
+                    await context.bot.send_message(chat_id=GROUP_ID, text=grup)
+                except:
+                    pass
             else:
                 raise Exception("Hasil tidak valid")
                 
         except Exception as e:
-            await update_status(f"❌ **Gagal Loop {success_count + 1}:**\n`{str(e)}`")
+            error_text = f"❌ **Gagal Loop {success_count + 1}:**\n`{str(e)}`"
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=error_text)
+            except:
+                pass
         
         if chat_id in active_loops and success_count < target:
             await asyncio.sleep(3)
@@ -366,7 +381,10 @@ async def loop_command(update, context):
     if chat_id in active_loops:
         active_loops.remove(chat_id)
     
-    await update.message.reply_text(f"🏁 **Selesai!** Berhasil: {success_count}")
+    try:
+        await update.message.reply_text(f"🏁 **Selesai!** Berhasil: {success_count}")
+    except:
+        pass
 
 async def stop_command(update, context):
     chat_id = update.effective_chat.id
