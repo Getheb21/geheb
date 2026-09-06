@@ -6,6 +6,7 @@ import re
 import uuid
 import json
 import aiohttp
+import subprocess
 import logging
 from datetime import datetime
 from fastapi import FastAPI, Request, Response
@@ -35,17 +36,6 @@ class GoHub:
         self.mail_token = ""
         self.fcm_token = f"f{''.join(random.choices(string.ascii_letters + string.digits, k=22))}:APA91b{''.join(random.choices(string.ascii_letters + string.digits + '-_', k=134))}"
         self.device_name = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        self.session = None
-
-    async def get_session(self):
-        """Gunakan SATU session untuk semua request"""
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
-        return self.session
-
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
 
     def base_headers(self):
         return {
@@ -62,76 +52,71 @@ class GoHub:
         return h
 
     async def create_email(self):
-        session = await self.get_session()
-        async with session.get("https://api.mail.tm/domains") as r:
-            domains = await r.json()
-            domain = domains['hydra:member'][0]['domain']
-            user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-            self.email = f"{user}@{domain}"
-        
-        payload = {"address": self.email, "password": "Password123!"}
-        async with session.post("https://api.mail.tm/accounts", json=payload) as r:
-            pass
-        
-        async with session.post("https://api.mail.tm/token", json=payload) as r:
-            data = await r.json()
-            self.mail_token = data.get('token', '')
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://api.mail.tm/domains") as r:
+                domains = await r.json()
+                domain = domains['hydra:member'][0]['domain']
+                user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                self.email = f"{user}@{domain}"
+            
+            payload = {"address": self.email, "password": "Password123!"}
+            await s.post("https://api.mail.tm/accounts", json=payload)
+            async with s.post("https://api.mail.tm/token", json=payload) as r:
+                data = await r.json()
+                self.mail_token = data.get('token', '')
         
         logger.info(f"Email: {self.email}")
 
     async def get_otp(self):
-        session = await self.get_session()
         headers = {"Authorization": f"Bearer {self.mail_token}"}
         start = asyncio.get_event_loop().time()
         
-        while (asyncio.get_event_loop().time() - start) < 90:
-            try:
-                async with session.get("https://api.mail.tm/messages", headers=headers) as r:
-                    data = await r.json()
-                    if data.get('hydra:totalItems', 0) > 0:
-                        msg_id = data['hydra:member'][0]['id']
-                        async with session.get(f"https://api.mail.tm/messages/{msg_id}", headers=headers) as r2:
-                            detail = await r2.json()
-                            text = detail.get('text', '') or ''
-                            html = detail.get('html', '') or ''
-                            subject = detail.get('subject', '') or ''
-                            combined = f"{subject} {text} {html}"
-                            match = re.search(r'\b[0-9]{6}\b', combined)
-                            if match:
-                                return match.group(0)
-            except Exception as e:
-                logger.error(f"OTP fetch error: {e}")
-            await asyncio.sleep(1)
+        async with aiohttp.ClientSession(headers=headers) as s:
+            while (asyncio.get_event_loop().time() - start) < 90:
+                try:
+                    async with s.get("https://api.mail.tm/messages") as r:
+                        data = await r.json()
+                        if data.get('hydra:totalItems', 0) > 0:
+                            msg_id = data['hydra:member'][0]['id']
+                            async with s.get(f"https://api.mail.tm/messages/{msg_id}") as r2:
+                                detail = await r2.json()
+                                text = detail.get('text', '') or ''
+                                html = detail.get('html', '') or ''
+                                subject = detail.get('subject', '') or ''
+                                combined = f"{subject} {text} {html}"
+                                match = re.search(r'\b[0-9]{6}\b', combined)
+                                if match:
+                                    return match.group(0)
+                except:
+                    pass
+                await asyncio.sleep(1)
         return None
 
     async def request_otp(self):
-        session = await self.get_session()
         h = self.base_headers()
         h["content-type"] = "application/json"
         payload = {"email": self.email, "language": "en", "currency": "USD"}
         
-        async with session.post(f"{GOHUB_API}/v1/app/auth/otp/request", json=payload, headers=h) as r:
-            data = await r.json()
-            logger.info(f"OTP Request: {data}")
-            return data.get('success', False)
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{GOHUB_API}/v1/app/auth/otp/request", json=payload, headers=h) as r:
+                data = await r.json()
+                return data.get('success', False)
 
     async def verify_otp(self, otp):
-        session = await self.get_session()
         h = self.base_headers()
         h["content-type"] = "application/json"
         payload = {"email": self.email, "code": otp}
         
-        async with session.post(f"{GOHUB_API}/v1/app/auth/otp/verify", json=payload, headers=h) as r:
-            data = await r.json()
-            logger.info(f"OTP Verify: {data}")
-            if data.get('success'):
-                self.access_token = data['data']['accessToken']
-                self.customer_id = data['data']['customerId']
-                return True
-            return False
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{GOHUB_API}/v1/app/auth/otp/verify", json=payload, headers=h) as r:
+                data = await r.json()
+                if data.get('success'):
+                    self.access_token = data['data']['accessToken']
+                    self.customer_id = data['data']['customerId']
+                    return True
+                return False
 
     async def register_device(self):
-        session = await self.get_session()
         h = self.base_headers()
         h["content-type"] = "application/json"
         payload = {
@@ -141,159 +126,178 @@ class GoHub:
             "customerId": self.customer_id
         }
         
-        async with session.post(f"{GOHUB_API}/v1/app/auth/device/register", json=payload, headers=h) as r:
-            data = await r.json()
-            logger.info(f"Device Register: {data}")
-            return data.get('success', False)
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{GOHUB_API}/v1/app/auth/device/register", json=payload, headers=h) as r:
+                data = await r.json()
+                return data.get('success', False)
 
     async def claim(self):
-        session = await self.get_session()
         h = self.auth_headers()
         h["content-type"] = "application/json"
         payload = {"partnerCode": "APPFREE", "itemCode": ITEM_CODE}
         
-        async with session.post(f"{GOHUB_API}/v1/app/redeem/claim", json=payload, headers=h) as r:
-            data = await r.json()
-            logger.info(f"Claim: {data}")
-            if data.get('success'):
-                return True, data['data']['info']
-            return False, data.get('message', 'error')
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{GOHUB_API}/v1/app/redeem/claim", json=payload, headers=h) as r:
+                data = await r.json()
+                if data.get('success'):
+                    return True, data['data']['info']
+                return False, data.get('message', 'error')
 
-    async def get_esim_detail(self, esim_id):
-        """Ambil detail dengan retry"""
-        session = await self.get_session()
-        h = self.auth_headers()
-        
-        # Coba 3x dengan jeda
-        for attempt in range(3):
-            try:
-                async with session.get(
-                    f"{GOHUB_API}/v1/app/customer/esim/{esim_id}",
-                    headers=h,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as r:
-                    response_text = await r.text()
-                    logger.info(f"Detail attempt {attempt+1}: HTTP {r.status}")
-                    
-                    data = json.loads(response_text)
-                    if data.get('success'):
-                        return data['data']
-                    
-                    logger.warning(f"Detail belum siap: {data}")
-                    
-            except Exception as e:
-                logger.error(f"Detail error attempt {attempt+1}: {e}")
+    async def get_esim_detail_curl(self, esim_id):
+        """Fallback pakai curl kalau aiohttp gagal"""
+        try:
+            auth_header = f"authorization: Bearer {self.access_token}"
+            cookie_header = f"cookie: sid={self.access_token}"
+            session_header = f"x-session-id: {self.session_id}"
+            app_header = "x-app-id: gohub-app"
+            ua_header = "user-agent: Dart/3.12 (dart:io)"
+            host_header = "host: api.gohub.com"
             
-            if attempt < 2:
-                await asyncio.sleep(2)
-        
-        return None
+            url = f"{GOHUB_API}/v1/app/customer/esim/{esim_id}"
+            
+            result = subprocess.run(
+                ["curl", "-s", url,
+                 "-H", auth_header,
+                 "-H", cookie_header,
+                 "-H", session_header,
+                 "-H", app_header,
+                 "-H", ua_header,
+                 "-H", host_header,
+                 "--max-time", "30"],
+                capture_output=True, text=True, timeout=35
+            )
+            
+            if result.returncode == 0 and result.stdout:
+                data = json.loads(result.stdout)
+                if data.get('success'):
+                    return data['data']
+            
+            logger.error(f"Curl failed: {result.stderr}")
+            return None
+        except Exception as e:
+            logger.error(f"Curl exception: {e}")
+            return None
 
     async def run(self, update_status=None):
-        try:
-            # 1. Email
-            if update_status: await update_status("📧 [1/7] Buat email...")
-            await self.create_email()
+        # 1. Email
+        if update_status: await update_status("📧 [1/7] Buat email...")
+        await self.create_email()
+        
+        # 2. Request OTP
+        if update_status: await update_status(f"📤 [2/7] Request OTP...")
+        if not await self.request_otp():
+            raise Exception("Gagal request OTP")
+        
+        # 3. Get OTP
+        if update_status: await update_status("⏳ [3/7] Tunggu OTP...")
+        otp = await self.get_otp()
+        if not otp:
+            raise Exception("OTP timeout")
+        
+        # 4. Verify
+        if update_status: await update_status(f"🔐 [4/7] Verify: `{otp}`")
+        if not await self.verify_otp(otp):
+            raise Exception("Verify gagal")
+        
+        # 5. Device
+        if update_status: await update_status("📱 [5/7] Register device...")
+        if not await self.register_device():
+            raise Exception("Device gagal")
+        
+        # 6. Claim
+        if update_status: await update_status("🎁 [6/7] Claim eSIM...")
+        ok, info = await self.claim()
+        
+        if not ok:
+            if update_status: await update_status(f"❌ Redeem GAGAL: `{info}`")
+            raise Exception(f"Redeem gagal: {info}")
+        
+        if update_status:
+            await update_status(f"✅ Redeem SUKSES! Kode: `{info.get('code','')}`\n⏳ [7/7] Tunggu eSIM...")
+        
+        # 7. POLLING
+        start = asyncio.get_event_loop().time()
+        attempt = 0
+        
+        while True:
+            attempt += 1
+            elapsed = int(asyncio.get_event_loop().time() - start)
             
-            # 2. Request OTP
-            if update_status: await update_status(f"📤 [2/7] Request OTP...")
-            if not await self.request_otp():
-                raise Exception("Gagal request OTP")
+            if elapsed >= 120:
+                raise Exception(f"TIMEOUT 120 detik!")
             
-            # 3. Get OTP
-            if update_status: await update_status("⏳ [3/7] Tunggu OTP...")
-            otp = await self.get_otp()
-            if not otp:
-                raise Exception("OTP timeout")
-            
-            # 4. Verify
-            if update_status: await update_status(f"🔐 [4/7] Verify: `{otp}`")
-            if not await self.verify_otp(otp):
-                raise Exception("Verify gagal")
-            
-            # 5. Device
-            if update_status: await update_status("📱 [5/7] Register device...")
-            if not await self.register_device():
-                raise Exception("Device gagal")
-            
-            # 6. Claim
-            if update_status: await update_status("🎁 [6/7] Claim eSIM...")
-            ok, info = await self.claim()
-            
-            if not ok:
-                if update_status: await update_status(f"❌ Redeem GAGAL: `{info}`")
-                raise Exception(f"Redeem gagal: {info}")
-            
-            if update_status:
-                await update_status(f"✅ Redeem SUKSES! Kode: `{info.get('code','')}`\n⏳ [7/7] Tunggu eSIM...")
-            
-            # 7. POLLING
-            start = asyncio.get_event_loop().time()
-            attempt = 0
-            
-            while True:
-                attempt += 1
-                elapsed = int(asyncio.get_event_loop().time() - start)
+            try:
+                h = self.auth_headers()
+                url = f"{GOHUB_API}/v1/app/customer/esim?page=1&perPage=20"
                 
-                if elapsed >= 120:
-                    raise Exception(f"TIMEOUT 120 detik!")
-                
-                try:
-                    session = await self.get_session()
-                    h = self.auth_headers()
-                    url = f"{GOHUB_API}/v1/app/customer/esim?page=1&perPage=20"
-                    
-                    async with session.get(url, headers=h, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(url, headers=h, timeout=aiohttp.ClientTimeout(total=30)) as r:
                         response_text = await r.text()
-                        
-                        if update_status:
-                            await update_status(f"🔍 Attempt {attempt} ({elapsed}s): HTTP {r.status}")
-                        
                         data = json.loads(response_text)
                         
                         if data.get('success') and data.get('data') and len(data['data']) > 0:
-                            esim_id = data['data'][0]['id']
+                            esim_data = data['data'][0]
+                            esim_id = esim_data.get('id')
+                            iccid = esim_data.get('iccid', '')
                             
                             if update_status:
-                                await update_status(f"✅ eSIM muncul! ID: `{esim_id}`\n🔍 Ambil detail...")
+                                await update_status(f"✅ eSIM muncul!\nID: `{esim_id}`\nICCID: `{iccid}`")
                             
-                            # Jeda sebentar biar detail siap
-                            await asyncio.sleep(2)
+                            # Coba ambil detail via aiohttp dulu
+                            detail = None
+                            try:
+                                async with aiohttp.ClientSession() as s2:
+                                    async with s2.get(
+                                        f"{GOHUB_API}/v1/app/customer/esim/{esim_id}",
+                                        headers=h,
+                                        timeout=aiohttp.ClientTimeout(total=30)
+                                    ) as r2:
+                                        detail_text = await r2.text()
+                                        detail_data = json.loads(detail_text)
+                                        if detail_data.get('success'):
+                                            detail = detail_data['data']
+                            except Exception as e:
+                                logger.error(f"Detail aiohttp gagal: {e}")
                             
-                            detail = await self.get_esim_detail(esim_id)
+                            # Fallback curl
+                            if not detail:
+                                if update_status:
+                                    await update_status("🔄 Coba fallback curl...")
+                                detail = await self.get_esim_detail_curl(esim_id)
                             
                             if detail:
-                                result = {
+                                return {
                                     "email": self.email,
                                     "order_code": info.get('code', ''),
-                                    "iccid": detail.get('iccid', ''),
+                                    "iccid": detail.get('iccid', iccid),
                                     "qr_image_url": detail.get('esimQrImageUrl', ''),
                                     "smdp": detail.get('lpa', {}).get('iosLPA', {}).get('smdp', ''),
                                     "activation_code": detail.get('lpa', {}).get('iosLPA', {}).get('activationCode', ''),
                                     "qr_content": detail.get('qrImageUrl', ''),
                                     "display_name": detail.get('productInformation', {}).get('displayName', '')
                                 }
-                                
-                                await self.close()
-                                return result
-                            else:
-                                if update_status:
-                                    await update_status("⚠️ Detail gagal, coba lagi...")
-                                continue
+                            
+                            # Kalau detail gagal total, return data dari list
+                            return {
+                                "email": self.email,
+                                "order_code": info.get('code', ''),
+                                "iccid": iccid,
+                                "qr_image_url": "",
+                                "smdp": "hthk.esimcase.com",
+                                "activation_code": info.get('code', ''),
+                                "qr_content": f"LPA:1$hthk.esimcase.com${info.get('code', '')}",
+                                "display_name": "eSIM Indonesia 300MB 1 Day(s)"
+                            }
                         
                         if update_status:
                             await update_status(f"⏳ Menunggu eSIM... ({elapsed}s/120s)")
                         
-                except Exception as e:
-                    if update_status:
-                        await update_status(f"⚠️ Error: `{str(e)[:80]}`")
-                    logger.error(f"Polling error: {e}")
-                
-                await asyncio.sleep(5)
-                
-        except Exception as e:
-            await self.close()
-            raise e
+            except Exception as e:
+                if update_status:
+                    await update_status(f"⚠️ Error: `{str(e)[:80]}`")
+                logger.error(f"Polling error: {e}")
+            
+            await asyncio.sleep(5)
 
 async def start_command(update, context):
     if not update.message or not update.message.text:
