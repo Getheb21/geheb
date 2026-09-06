@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 TOKEN = "8824915756:AAEYK27n7r3uLATXvJo8yej9A-iuF6ZDHmo"
 GROUP_ID = -1004339334563
 QRIS_URL = "https://r9.paidweh1.workers.dev/public/1776930765841_ec1ed32c-db99-4023-aede-176bf5f2b1c0.jpeg"
+OWNER = "@kopi_kapal1"
 
 app = FastAPI()
 telegram_app = None
@@ -316,8 +317,7 @@ async def start_command(update, context):
         qr_content = result['qr_content']
         qr_image_url = result.get('qr_image_url', '')
         
-        # QR Content tampil sebagai LINK yang bisa di-klik
-        # Telegram akan auto-copy kalau link di-klik
+        # Format sesuai permintaan
         final_text = (
             f"✅ **eSIM BERHASIL!**\n\n"
             f"📧 {result['email']}\n"
@@ -327,29 +327,36 @@ async def start_command(update, context):
             f"📅 {result['expiry_date']}\n\n"
             f"🔗 SM-DP+: {result['smdp']}\n"
             f"🔑 Activation: {result['activation_code']}\n\n"
-            f"📲 QR Content (klik untuk salin):\n"
-            f"{qr_content}\n\n"
+            f"📲 QR Content:\n"
+            f"`{qr_content}`\n"
+        )
+        
+        # QR link dan owner
+        if qr_image_url:
+            final_text += f"QR link: {qr_image_url}\n"
+        else:
+            final_text += f"QR link: -\n"
+        
+        final_text += (
+            f"Owner: {OWNER}\n\n"
             f"BY: {username}"
         )
         
         # Keyboard
         keyboard_buttons = []
         
-        # Tombol QR Image
         if qr_image_url:
             keyboard_buttons.append([
                 InlineKeyboardButton("🖼️ Buka QR Image", url=qr_image_url)
             ])
         
-        # Tombol QRIS Donasi
         keyboard_buttons.append([
             InlineKeyboardButton("💳 QRIS Donasi", url=QRIS_URL)
         ])
         
         keyboard = InlineKeyboardMarkup(keyboard_buttons)
         
-        # Kirim pesan dengan QR Content sebagai teks yang bisa di-copy
-        # Telegram punya fitur: kalau teks di-tap lama, bisa copy
+        # Kirim pesan utama
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -364,19 +371,20 @@ async def start_command(update, context):
                 reply_markup=keyboard
             )
         
-        # Kirim QR Content terpisah sebagai pesan yang MUDAH di-copy
+        # Kirim QR Content terpisah (mono format)
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=qr_content,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Tap untuk Salin", callback_data=f"copy|{qr_content}")]
-                ])
+                text=f"`{qr_content}`",
+                parse_mode="Markdown"
             )
         except:
-            pass
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=qr_content
+            )
         
-        # Kirim QR image sebagai foto
+        # Kirim QR image
         if qr_image_url:
             try:
                 await context.bot.send_photo(
@@ -387,7 +395,7 @@ async def start_command(update, context):
             except:
                 pass
         
-        # Kirim ke grup
+        # Grup
         grup_text = (
             f"Halo {username}\n\n"
             f"✅ eSIM GoHub berhasil!\n\n"
@@ -409,23 +417,6 @@ async def start_command(update, context):
             await context.bot.send_message(chat_id=chat_id, text=error_text, parse_mode="Markdown")
         except:
             pass
-
-async def button_callback(update, context):
-    query = update.callback_query
-    
-    if query.data.startswith("copy|"):
-        qr_content = query.data.split("|", 1)[1]
-        await query.answer("✅ Tersalin!")
-        
-        try:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=qr_content
-            )
-        except:
-            pass
-    
-    await query.answer()
 
 async def loop_command(update, context):
     if not update.message or not update.message.text:
@@ -476,8 +467,14 @@ async def loop_command(update, context):
                     f"💳 {result['iccid']}\n"
                     f"🔑 {result['activation_code']}\n"
                     f"📱 {result['display_name']}\n\n"
-                    f"📲 QR Content:\n{qr_content}"
+                    f"📲 QR Content:\n"
+                    f"`{qr_content}`\n"
                 )
+                
+                if qr_image_url:
+                    success += f"QR link: {qr_image_url}\n"
+                
+                success += f"Owner: {OWNER}"
                 
                 keyboard_buttons = []
                 
@@ -509,16 +506,17 @@ async def loop_command(update, context):
                     except:
                         pass
                 
-                # Kirim QR content terpisah untuk mudah di-copy
+                # QR Content terpisah (mono)
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=qr_content
+                        text=f"`{qr_content}`",
+                        parse_mode="Markdown"
                     )
                 except:
                     pass
                 
-                # Kirim QR image terpisah
+                # QR image terpisah
                 if qr_image_url:
                     try:
                         await context.bot.send_photo(
@@ -580,10 +578,6 @@ async def webhook(request: Request):
             update = Update.de_json(data, telegram_app.bot)
             if update and update.message:
                 await telegram_app.process_update(update)
-        elif "callback_query" in data:
-            update = Update.de_json(data, telegram_app.bot)
-            if update and update.callback_query:
-                await telegram_app.process_update(update)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
     return {"status": "ok"}
@@ -599,7 +593,6 @@ async def startup_event():
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("loop", loop_command))
     telegram_app.add_handler(CommandHandler("stop", stop_command))
-    telegram_app.add_handler(CallbackQueryHandler(button_callback))
     await telegram_app.initialize()
     await telegram_app.start()
     logger.info("Bot ready!")
