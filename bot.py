@@ -26,7 +26,7 @@ active_loops = set()
 GOHUB_API = "https://api.gohub.com"
 GOHUB_PARTNER_CODE = "APPFREE"
 GOHUB_ITEM_CODE = "BUTECIDN3DF3HM0100"
-ESIM_WAIT_TIMEOUT = 120  # 2 MENIT
+ESIM_WAIT_TIMEOUT = 120
 ESIM_POLL_INTERVAL = 5
 
 class GoHubBot:
@@ -175,41 +175,6 @@ class GoHubBot:
                     return True, data['data']['info']
                 return False, data.get('message', 'Unknown')
 
-    async def poll_esim_list(self, status_callback=None):
-        """POLLING eSIM LIST SAMPAI MUNCUL ATAU 2 MENIT"""
-        start_time = asyncio.get_event_loop().time()
-        
-        while (asyncio.get_event_loop().time() - start_time) < ESIM_WAIT_TIMEOUT:
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            remaining = ESIM_WAIT_TIMEOUT - elapsed
-            
-            try:
-                headers = self.get_auth_headers()
-                url = f"{self.base_url}/v1/app/customer/esim?page=1&perPage=20"
-                
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers) as r:
-                        data = await r.json()
-                        
-                        if data.get('success') and data.get('data'):
-                            esim_list = data['data']
-                            logger.info(f"eSIM MUNCUL! Setelah {elapsed} detik. Total: {len(esim_list)}")
-                            if status_callback:
-                                await status_callback(f"✅ eSIM muncul setelah {elapsed} detik!")
-                            return esim_list
-                        
-                        if status_callback:
-                            await status_callback(f"⏳ Menunggu eSIM... ({elapsed}s/{ESIM_WAIT_TIMEOUT}s)")
-                        
-                        logger.info(f"eSIM belum muncul. Elapsed: {elapsed}s, Remaining: {remaining}s")
-                        
-            except Exception as e:
-                logger.error(f"Polling error: {e}")
-            
-            await asyncio.sleep(ESIM_POLL_INTERVAL)
-        
-        raise Exception(f"TIMEOUT! eSIM tidak muncul setelah {ESIM_WAIT_TIMEOUT} detik")
-
     async def get_esim_detail(self, esim_id):
         headers = self.get_auth_headers()
         url = f"{self.base_url}/v1/app/customer/esim/{esim_id}"
@@ -217,6 +182,7 @@ class GoHubBot:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as r:
                 data = await r.json()
+                logger.info(f"Detail eSIM: {r.status}")
                 if data.get('success'):
                     return data['data']
                 return None
@@ -235,7 +201,7 @@ class GoHubBot:
         
         # 3. Fetch OTP
         if status_callback:
-            await status_callback("⏳ [3/7] Menunggu OTP masuk...")
+            await status_callback("⏳ [3/7] Menunggu OTP...")
         otp = await self.fetch_otp()
         if not otp:
             raise Exception("OTP timeout")
@@ -255,45 +221,75 @@ class GoHubBot:
         # 6. Claim eSIM
         if status_callback:
             await status_callback("🎁 [6/7] Claim eSIM...")
+        
         claim_ok, claim_data = await self.claim_esim()
         
         if not claim_ok:
             if status_callback:
-                await status_callback(f"❌ Redeem GAGAL: `{claim_data}`")
+                await status_callback(f"❌ **Redeem GAGAL:** `{claim_data}`")
             raise Exception(f"Redeem gagal: {claim_data}")
         
         if status_callback:
             await status_callback(
                 f"✅ **Redeem SUKSES!**\n"
                 f"📦 Kode: `{claim_data.get('code', '')}`\n"
-                f"⏳ [7/7] Menunggu eSIM diproses (max 2 menit)..."
+                f"⏳ [7/7] Menunggu eSIM... (max 2 menit)"
             )
         
-        # 7. POLLING eSIM - WAJIB NUNGGU SAMPAI MUNCUL
-        esim_list = await self.poll_esim_list(status_callback)
+        # 7. POLLING eSIM — INI YANG PENTING
+        start_time = asyncio.get_event_loop().time()
         
-        if not esim_list:
-            raise Exception("eSIM list kosong")
-        
-        # Ambil detail eSIM pertama
-        esim_detail = await self.get_esim_detail(esim_list[0]['id'])
-        if not esim_detail:
-            raise Exception("Gagal ambil detail eSIM")
-        
-        result = {
-            "email": self.email,
-            "customer_id": self.customer_id,
-            "order_code": claim_data.get('code', ''),
-            "iccid": esim_detail.get('iccid', ''),
-            "qr_image_url": esim_detail.get('esimQrImageUrl', ''),
-            "smdp": esim_detail.get('lpa', {}).get('iosLPA', {}).get('smdp', ''),
-            "activation_code": esim_detail.get('lpa', {}).get('iosLPA', {}).get('activationCode', ''),
-            "qr_content": esim_detail.get('qrImageUrl', ''),
-            "display_name": esim_detail.get('productInformation', {}).get('displayName', '')
-        }
-        
-        logger.info(f"SUKSES! ICCID: {result['iccid']}")
-        return result
+        while True:
+            elapsed = int(asyncio.get_event_loop().time() - start_time)
+            
+            if elapsed >= ESIM_WAIT_TIMEOUT:
+                raise Exception(f"TIMEOUT! eSIM tidak muncul setelah {ESIM_WAIT_TIMEOUT} detik")
+            
+            try:
+                headers = self.get_auth_headers()
+                url = f"{self.base_url}/v1/app/customer/esim?page=1&perPage=20"
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers) as r:
+                        data = await r.json()
+                        
+                        if data.get('success') and data.get('data'):
+                            esim_list = data['data']
+                            
+                            if status_callback:
+                                await status_callback(f"✅ eSIM muncul setelah {elapsed} detik!")
+                            
+                            # Ambil detail
+                            esim_detail = await self.get_esim_detail(esim_list[0]['id'])
+                            if not esim_detail:
+                                raise Exception("Gagal ambil detail eSIM")
+                            
+                            result = {
+                                "email": self.email,
+                                "customer_id": self.customer_id,
+                                "order_code": claim_data.get('code', ''),
+                                "iccid": esim_detail.get('iccid', ''),
+                                "qr_image_url": esim_detail.get('esimQrImageUrl', ''),
+                                "smdp": esim_detail.get('lpa', {}).get('iosLPA', {}).get('smdp', ''),
+                                "activation_code": esim_detail.get('lpa', {}).get('iosLPA', {}).get('activationCode', ''),
+                                "qr_content": esim_detail.get('qrImageUrl', ''),
+                                "display_name": esim_detail.get('productInformation', {}).get('displayName', '')
+                            }
+                            
+                            logger.info(f"SUKSES! ICCID: {result['iccid']}")
+                            return result
+                        
+                        if status_callback:
+                            await status_callback(f"⏳ Menunggu eSIM... ({elapsed}s/{ESIM_WAIT_TIMEOUT}s)")
+                        
+                        logger.info(f"eSIM belum muncul. Elapsed: {elapsed}s")
+                        
+            except aiohttp.ClientError as e:
+                logger.error(f"Network error: {e}")
+            except Exception as e:
+                logger.error(f"Polling error: {e}")
+            
+            await asyncio.sleep(ESIM_POLL_INTERVAL)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
