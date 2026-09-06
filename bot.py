@@ -26,6 +26,8 @@ active_loops = set()
 GOHUB_API = "https://api.gohub.com"
 GOHUB_PARTNER_CODE = "APPFREE"
 GOHUB_ITEM_CODE = "BUTECIDN3DF3HM0100"
+ESIM_DELAY_TIMEOUT = 120  # Timeout nunggu eSIM muncul (detik)
+ESIM_POLL_INTERVAL = 5    # Interval polling (detik)
 
 class GoHubBot:
     def __init__(self):
@@ -101,14 +103,12 @@ class GoHubBot:
                                     combined = f"{subject} {raw_text} {raw_html}"
                                     logger.info(f"Email content: {combined[:200]}")
                                     
-                                    # Cari OTP 6 digit
                                     match = re.search(r'(?:otp|code|verification|login)[:\s\-]*([0-9]{6})', combined, re.IGNORECASE)
                                     if match:
                                         otp = match.group(1).strip()
                                         logger.info(f"OTP found: {otp}")
                                         return otp
                                     
-                                    # Fallback: cari 6 digit angka
                                     words = re.findall(r'\b[0-9]{6}\b', combined)
                                     if words:
                                         logger.info(f"OTP found (fallback): {words[0]}")
@@ -231,33 +231,19 @@ class GoHubBot:
                 return None
 
     async def get_esim_list(self):
-        """Dapatkan daftar eSIM customer dengan retry"""
+        """Dapatkan daftar eSIM customer"""
         headers = self.get_headers_with_auth()
         
-        # Coba beberapa kali karena eSIM mungkin perlu waktu diproses
-        for attempt in range(5):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{self.base_url}/v1/app/customer/esim?page=1&perPage=20",
-                        headers=headers
-                    ) as r:
-                        data = await r.json()
-                        logger.info(f"Get eSIM list (attempt {attempt+1}) response: {data}")
-                        
-                        if data.get('success') and data.get('data'):
-                            return data['data']
-                        
-                        # Kalau belum ada data, tunggu dulu
-                        if attempt < 4:
-                            await asyncio.sleep(3)
-                        continue
-            except Exception as e:
-                logger.error(f"Error get eSIM list (attempt {attempt+1}): {e}")
-                if attempt < 4:
-                    await asyncio.sleep(3)
-        
-        return []
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.base_url}/v1/app/customer/esim?page=1&perPage=20",
+                headers=headers
+            ) as r:
+                data = await r.json()
+                logger.info(f"Get eSIM list response: {data}")
+                if data.get('success') and data.get('data'):
+                    return data['data']
+                return []
 
     async def get_esim_detail(self, esim_id):
         headers = self.get_headers_with_auth()
@@ -272,6 +258,42 @@ class GoHubBot:
                 if data.get('success'):
                     return data['data']
                 return None
+
+    async def wait_for_esim(self, status_callback=None, timeout=ESIM_DELAY_TIMEOUT):
+        """Polling eSIM list sampai muncul atau timeout"""
+        start_time = asyncio.get_event_loop().time()
+        last_esim_count = 0
+        
+        while (asyncio.get_event_loop().time() - start_time) < timeout:
+            try:
+                esim_list = await self.get_esim_list()
+                
+                if esim_list:
+                    elapsed = int(asyncio.get_event_loop().time() - start_time)
+                    logger.info(f"eSIM muncul setelah {elapsed} detik!")
+                    
+                    if status_callback:
+                        await status_callback(f"✅ eSIM terdeteksi setelah {elapsed} detik!")
+                    
+                    return esim_list
+                else:
+                    elapsed = int(asyncio.get_event_loop().time() - start_time)
+                    remaining = timeout - elapsed
+                    
+                    if status_callback and elapsed % 10 == 0:
+                        await status_callback(
+                            f"⏳ Menunggu eSIM diproses... "
+                            f"({elapsed}s berlalu, timeout {remaining}s lagi)"
+                        )
+                    
+                    logger.info(f"eSIM belum muncul, menunggu... (elapsed: {elapsed}s)")
+                    
+            except Exception as e:
+                logger.error(f"Error polling eSIM: {e}")
+            
+            await asyncio.sleep(ESIM_POLL_INTERVAL)
+        
+        raise Exception(f"Timeout! eSIM tidak muncul setelah {timeout} detik")
 
     async def full_registration_flow(self, status_callback=None):
         try:
@@ -312,18 +334,16 @@ class GoHubBot:
             if not order_info:
                 raise Exception("Gagal claim eSIM - mungkin rate limit")
             
-            # Step 7: Get eSIM detail dengan retry
+            # Step 7: Tunggu eSIM muncul dengan polling
             if status_callback:
-                await status_callback("📋 [7/7] Mengambil detail eSIM...")
+                await status_callback(
+                    f"📋 [7/7] Menunggu eSIM diproses...\n"
+                    f"⏱️ Timeout: {ESIM_DELAY_TIMEOUT} detik\n"
+                    f"🔄 Polling tiap {ESIM_POLL_INTERVAL} detik"
+                )
             
-            esim_list = []
-            for retry in range(3):
-                esim_list = await self.get_esim_list()
-                if esim_list:
-                    break
-                if status_callback and retry < 2:
-                    await status_callback(f"⏳ Menunggu eSIM diproses... (retry {retry+1}/3)")
-                await asyncio.sleep(5)
+            # Polling eSIM sampai muncul (max 120 detik)
+            esim_list = await self.wait_for_esim(status_callback, timeout=ESIM_DELAY_TIMEOUT)
             
             if not esim_list:
                 raise Exception("Gagal mengambil daftar eSIM - tidak ada data")
@@ -332,6 +352,7 @@ class GoHubBot:
             latest_esim = esim_list[0]
             logger.info(f"Latest eSIM: {latest_esim}")
             
+            # Ambil detail eSIM
             esim_detail = await self.get_esim_detail(latest_esim['id'])
             if not esim_detail:
                 raise Exception("Gagal mengambil detail eSIM")
